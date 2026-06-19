@@ -9,6 +9,9 @@ import socket
 import logging
 import traceback
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 # ─── LOGGING SETUP ────────────────────────────────────────────────────────
 # This is the main thing that was missing before: every fetch function was
@@ -719,13 +722,29 @@ def api_historical():
         return jsonify({"error": str(e)}), 500
 
 def is_market_open():
-    now = datetime.now()
-    # IST offset — running in IST env
-    if now.weekday() >= 5:  # Saturday / Sunday
+    # IMPORTANT: always compute "now" in IST explicitly, regardless of what
+    # timezone the server itself is running in. Before this fix, datetime.now()
+    # used the SERVER's local clock — if the server is hosted on a machine set
+    # to UTC (very common on cloud VMs/containers), the market would show as
+    # CLOSED even during real IST market hours (9:15–3:30), because UTC is
+    # 5 hours 30 minutes behind IST.
+    now_ist = datetime.now(IST)
+    logger.debug(f"is_market_open: current IST time = {now_ist.strftime('%Y-%m-%d %H:%M:%S %A')}")
+
+    if now_ist.weekday() >= 5:  # Saturday / Sunday
+        logger.info("is_market_open: weekend — market closed.")
         return False
-    market_open  = now.replace(hour=9,  minute=15, second=0)
-    market_close = now.replace(hour=15, minute=30, second=0)
-    return market_open <= now <= market_close
+
+    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    result = market_open <= now_ist <= market_close
+
+    logger.info(
+        f"is_market_open: now_ist={now_ist.strftime('%H:%M:%S')}, "
+        f"open_window={market_open.strftime('%H:%M')}-{market_close.strftime('%H:%M')} IST, "
+        f"result={result}"
+    )
+    return result
 
 @app.route("/api/ws_token")
 def ws_token():
@@ -754,7 +773,8 @@ def api_debug():
     debug_info["access_token_present"] = bool(ACCESS_TOKEN)
     debug_info["access_token_length"]  = len(ACCESS_TOKEN) if ACCESS_TOKEN else 0
     debug_info["market_open"] = is_market_open()
-    debug_info["server_time"] = datetime.now().isoformat()
+    debug_info["server_raw_time"] = datetime.now().isoformat()       # whatever timezone the server/OS is in
+    debug_info["ist_time"] = datetime.now(IST).isoformat()           # always actual IST, used for the market check
 
     # LTP
     try:
