@@ -5,6 +5,7 @@ import os
 import requests
 import json
 import math
+import socket
 from datetime import datetime, timedelta
 
 load_dotenv()
@@ -469,6 +470,38 @@ def fetch_wallet_balance():
         print(f"Wallet fetch error: {e}")
     return {"available_margin": None, "used_margin": None}
 
+def get_local_ip():
+    """
+    Get the local network IP address of the machine running this Flask app
+    (e.g. 192.168.x.x). Useful so you can open the dashboard from your phone
+    or another device on the same Wi-Fi/LAN using http://<this_ip>:5000
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # This doesn't actually send any packets — connect() on a UDP socket
+        # just picks which local interface/IP would be used to reach 8.8.8.8.
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+def get_public_ip():
+    """
+    Get the public-facing IP address of this server (relevant if it's
+    deployed on a cloud VM / VPS rather than run locally). Returns None if
+    it can't be reached so the UI can show '--' instead of breaking.
+    """
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("ip")
+    except Exception as e:
+        print(f"Public IP fetch error: {e}")
+    return None
+
 
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
 
@@ -500,6 +533,11 @@ def api_signals():
 
     wallet = fetch_wallet_balance()
 
+    server_ip = {
+        "local":  get_local_ip(),
+        "public": get_public_ip()
+    }
+
     # Latest candles for chart (last 60 1m candles)
     chart_candles = []
     for c in candles_1m[-60:]:
@@ -514,6 +552,7 @@ def api_signals():
         "signals":    signals,
         "candles":    chart_candles,
         "wallet":     wallet,
+        "server_ip":  server_ip,
         "timestamp":  datetime.now().strftime("%H:%M:%S"),
         "market_open": market_open
     })

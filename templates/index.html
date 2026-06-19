@@ -67,7 +67,7 @@
   .badge-closed { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
   .topbar-right { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 
-  /* ── WALLET BADGE ── */
+  /* ── WALLET / IP BADGE ── */
   .wallet-box {
     display: flex;
     align-items: center;
@@ -341,6 +341,20 @@
     <span class="badge badge-live" id="market-badge">● LIVE</span>
   </div>
   <div class="topbar-right">
+    <div class="wallet-box">
+      <span class="wallet-icon">🌐</span>
+      <div>
+        <div class="wallet-label">Local IP</div>
+        <div class="wallet-value" id="ip-local">--</div>
+      </div>
+    </div>
+    <div class="wallet-box">
+      <span class="wallet-icon">🌍</span>
+      <div>
+        <div class="wallet-label">Public IP</div>
+        <div class="wallet-value" id="ip-public">--</div>
+      </div>
+    </div>
     <div class="wallet-box">
       <span class="wallet-icon">💰</span>
       <div>
@@ -729,7 +743,7 @@ async function loadData() {
     const res  = await fetch('/api/signals');
     const data = await res.json();
 
-    const { signals, candles, wallet, timestamp, market_open } = data;
+    const { signals, candles, wallet, server_ip, timestamp, market_open } = data;
     const ind  = signals.indicators || {};
     const price = ind.price;
 
@@ -754,6 +768,12 @@ async function loadData() {
         '₹' + Number(wallet.available_margin).toLocaleString('en-IN', { minimumFractionDigits: 2 });
     } else {
       document.getElementById('wallet-balance').textContent = '--';
+    }
+
+    // ── Server IP (local + public) ──
+    if (server_ip) {
+      document.getElementById('ip-local').textContent  = server_ip.local  || '--';
+      document.getElementById('ip-public').textContent = server_ip.public || '--';
     }
 
     // ── Market badge ──
