@@ -6,7 +6,29 @@ import requests
 import json
 import math
 import socket
+import logging
+import traceback
 from datetime import datetime, timedelta
+
+# ─── LOGGING SETUP ────────────────────────────────────────────────────────
+# This is the main thing that was missing before: every fetch function was
+# only doing `print(f"... error: {e}")`, which (a) only fires on a raw
+# exception — NOT on a bad status code or an API error payload — and
+# (b) doesn't tell you WHAT Upstox actually said. Now everything goes
+# through `logger`, prints to console AND writes to app.log, and we log
+# status codes + full response bodies even when there's no exception.
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),                       # prints to terminal
+        logging.FileHandler(LOG_FILE, encoding="utf-8") # also saves to app.log
+    ]
+)
+logger = logging.getLogger("nifty_app")
 
 load_dotenv()
 
@@ -16,6 +38,16 @@ CORS(app)
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 INSTRUMENT_KEY_ENCODED = "NSE_INDEX%7CNifty%2050"
+
+if not ACCESS_TOKEN:
+    logger.error(
+        "ACCESS_TOKEN is missing/empty! Check that a .env file exists next to "
+        "app.py and contains ACCESS_TOKEN=<your_token>. Every Upstox call will "
+        "fail with 401 Unauthorized until this is fixed."
+    )
+else:
+    # don't log the full token (sensitive), just confirm it's loaded + length
+    logger.info(f"ACCESS_TOKEN loaded (length={len(ACCESS_TOKEN)} chars).")
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -182,6 +214,11 @@ def generate_signals(candles_1m, candles_15m, market_open=True):
     closed_reason = ["Market is closed (9:15 AM – 3:30 PM IST, Mon–Fri)"]
 
     if not candles_1m or len(candles_1m) < 30:
+        logger.warning(
+            f"generate_signals: not enough 1m candle data "
+            f"(got {len(candles_1m) if candles_1m else 0}, need >= 30). "
+            f"Signals will stay as defaults/CLOSED."
+        )
         # Not enough data to compute anything meaningful.
         if not market_open:
             signals["scalping"] = {"signal": "CLOSED", "confidence": 0, "reason": closed_reason}
@@ -406,29 +443,72 @@ def generate_signals(candles_1m, candles_15m, market_open=True):
 
 
 # ─── DATA FETCHING ───────────────────────────────────────────────────────────
+# Every function below now:
+#   1. Logs the exact URL it's hitting
+#   2. Logs the HTTP status code it got back
+#   3. Logs the raw response body if status != success/200 (so you can see
+#      Upstox's actual error message, e.g. "Invalid token", "Instrument key
+#      not found", "Too many requests", etc.)
+#   4. Logs full traceback on exceptions instead of just the exception text
 
 def fetch_intraday(unit="minutes", interval="1"):
     url = f"https://api.upstox.com/v3/historical-candle/intraday/{INSTRUMENT_KEY_ENCODED}/{unit}/{interval}"
+    logger.debug(f"fetch_intraday: GET {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
+        logger.debug(f"fetch_intraday: status_code={r.status_code}")
+        try:
+            data = r.json()
+        except ValueError:
+            logger.error(f"fetch_intraday: response was not valid JSON. Raw text: {r.text[:500]}")
+            return []
+
         if data.get("status") == "success":
-            return data["data"]["candles"]
+            candles = data["data"]["candles"]
+            logger.info(f"fetch_intraday: got {len(candles)} candles for {unit}/{interval}")
+            return candles
+        else:
+            logger.error(
+                f"fetch_intraday: Upstox returned non-success status. "
+                f"HTTP={r.status_code}, body={json.dumps(data)[:1000]}"
+            )
+    except requests.exceptions.Timeout:
+        logger.error(f"fetch_intraday: request timed out after 10s ({url})")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"fetch_intraday: connection error — check internet/firewall. {e}")
     except Exception as e:
-        print(f"Intraday fetch error: {e}")
+        logger.error(f"fetch_intraday: unexpected error: {e}\n{traceback.format_exc()}")
     return []
 
 def fetch_historical(unit="days", interval="1", days_back=90):
     to_date = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     url = f"https://api.upstox.com/v3/historical-candle/{INSTRUMENT_KEY_ENCODED}/{unit}/{interval}/{to_date}/{from_date}"
+    logger.debug(f"fetch_historical: GET {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
+        logger.debug(f"fetch_historical: status_code={r.status_code}")
+        try:
+            data = r.json()
+        except ValueError:
+            logger.error(f"fetch_historical: response was not valid JSON. Raw text: {r.text[:500]}")
+            return []
+
         if data.get("status") == "success":
-            return data["data"]["candles"]
+            candles = data["data"]["candles"]
+            logger.info(f"fetch_historical: got {len(candles)} candles")
+            return candles
+        else:
+            logger.error(
+                f"fetch_historical: Upstox returned non-success status. "
+                f"HTTP={r.status_code}, body={json.dumps(data)[:1000]}"
+            )
+    except requests.exceptions.Timeout:
+        logger.error(f"fetch_historical: request timed out after 10s ({url})")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"fetch_historical: connection error — check internet/firewall. {e}")
     except Exception as e:
-        print(f"Historical fetch error: {e}")
+        logger.error(f"fetch_historical: unexpected error: {e}\n{traceback.format_exc()}")
     return []
 
 def fetch_ltp():
@@ -439,16 +519,36 @@ def fetch_ltp():
     a real price instead of '--' when intraday candles aren't available yet.
     """
     url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={INSTRUMENT_KEY_ENCODED}"
+    logger.debug(f"fetch_ltp: GET {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
+        logger.debug(f"fetch_ltp: status_code={r.status_code}")
+        try:
+            data = r.json()
+        except ValueError:
+            logger.error(f"fetch_ltp: response was not valid JSON. Raw text: {r.text[:500]}")
+            return None
+
         if data.get("status") == "success":
             quote_data = data.get("data", {})
-            for _key, val in quote_data.items():
+            if not quote_data:
+                logger.warning(f"fetch_ltp: status=success but 'data' object is empty. Full body: {json.dumps(data)[:1000]}")
+            for key, val in quote_data.items():
                 if isinstance(val, dict) and "last_price" in val and val["last_price"] is not None:
+                    logger.info(f"fetch_ltp: got last_price={val['last_price']} for key={key}")
                     return val["last_price"]
+            logger.warning(f"fetch_ltp: no 'last_price' field found in any quote entry. body={json.dumps(data)[:1000]}")
+        else:
+            logger.error(
+                f"fetch_ltp: Upstox returned non-success status. "
+                f"HTTP={r.status_code}, body={json.dumps(data)[:1000]}"
+            )
+    except requests.exceptions.Timeout:
+        logger.error(f"fetch_ltp: request timed out after 10s ({url})")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"fetch_ltp: connection error — check internet/firewall. {e}")
     except Exception as e:
-        print(f"LTP fetch error: {e}")
+        logger.error(f"fetch_ltp: unexpected error: {e}\n{traceback.format_exc()}")
     return None
 
 def fetch_wallet_balance():
@@ -457,17 +557,42 @@ def fetch_wallet_balance():
     Upstox's funds-and-margin endpoint.
     """
     url = "https://api.upstox.com/v2/user/get-funds-and-margin"
+    logger.debug(f"fetch_wallet_balance: GET {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
+        logger.debug(f"fetch_wallet_balance: status_code={r.status_code}")
+        try:
+            data = r.json()
+        except ValueError:
+            logger.error(f"fetch_wallet_balance: response was not valid JSON. Raw text: {r.text[:500]}")
+            return {"available_margin": None, "used_margin": None}
+
         if data.get("status") == "success":
             equity = data.get("data", {}).get("equity", {})
-            return {
+            if not equity:
+                logger.warning(
+                    f"fetch_wallet_balance: status=success but no 'equity' key in data. "
+                    f"This usually means the account has no equity segment activated, "
+                    f"or the token's scope doesn't include funds. Full body: {json.dumps(data)[:1000]}"
+                )
+            result = {
                 "available_margin": equity.get("available_margin"),
                 "used_margin":      equity.get("used_margin"),
             }
+            logger.info(f"fetch_wallet_balance: {result}")
+            return result
+        else:
+            logger.error(
+                f"fetch_wallet_balance: Upstox returned non-success status (likely 401 "
+                f"Unauthorized if token expired, or 403 if scope/permission issue). "
+                f"HTTP={r.status_code}, body={json.dumps(data)[:1000]}"
+            )
+    except requests.exceptions.Timeout:
+        logger.error(f"fetch_wallet_balance: request timed out after 10s ({url})")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"fetch_wallet_balance: connection error — check internet/firewall. {e}")
     except Exception as e:
-        print(f"Wallet fetch error: {e}")
+        logger.error(f"fetch_wallet_balance: unexpected error: {e}\n{traceback.format_exc()}")
     return {"available_margin": None, "used_margin": None}
 
 def get_local_ip():
@@ -482,7 +607,8 @@ def get_local_ip():
         # just picks which local interface/IP would be used to reach 8.8.8.8.
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"get_local_ip: could not determine local IP, defaulting to 127.0.0.1. {e}")
         ip = "127.0.0.1"
     finally:
         s.close()
@@ -498,8 +624,10 @@ def get_public_ip():
         r = requests.get("https://api.ipify.org?format=json", timeout=5)
         if r.status_code == 200:
             return r.json().get("ip")
+        else:
+            logger.warning(f"get_public_ip: ipify returned HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"Public IP fetch error: {e}")
+        logger.error(f"get_public_ip: error fetching public IP: {e}")
     return None
 
 
@@ -511,65 +639,84 @@ def home():
 
 @app.route("/api/signals")
 def api_signals():
-    market_open = is_market_open()
+    try:
+        market_open = is_market_open()
+        logger.debug(f"api_signals: market_open={market_open}")
 
-    candles_1m  = fetch_intraday("minutes", "1")
-    candles_15m = fetch_intraday("minutes", "15")
+        candles_1m  = fetch_intraday("minutes", "1")
+        candles_15m = fetch_intraday("minutes", "15")
 
-    # Reverse: API returns newest first
-    candles_1m  = list(reversed(candles_1m))
-    candles_15m = list(reversed(candles_15m))
+        logger.debug(f"api_signals: raw candle counts -> 1m={len(candles_1m)}, 15m={len(candles_15m)}")
 
-    signals = generate_signals(candles_1m, candles_15m, market_open)
+        # Reverse: API returns newest first
+        candles_1m  = list(reversed(candles_1m))
+        candles_15m = list(reversed(candles_15m))
 
-    # Always try to show the real, live LTP — this covers the case where the
-    # market is closed (or hasn't opened yet today) and intraday candles are
-    # empty, which previously caused the price to show as '--'.
-    ltp = fetch_ltp()
-    if ltp is not None:
-        signals["indicators"]["price"] = round(ltp, 2)
-    elif candles_1m:
-        signals["indicators"]["price"] = round(candles_1m[-1][4], 2)
+        signals = generate_signals(candles_1m, candles_15m, market_open)
 
-    wallet = fetch_wallet_balance()
+        # Always try to show the real, live LTP — this covers the case where the
+        # market is closed (or hasn't opened yet today) and intraday candles are
+        # empty, which previously caused the price to show as '--'.
+        ltp = fetch_ltp()
+        if ltp is not None:
+            signals["indicators"]["price"] = round(ltp, 2)
+        elif candles_1m:
+            signals["indicators"]["price"] = round(candles_1m[-1][4], 2)
+        else:
+            logger.warning("api_signals: no LTP and no candles available — price will be missing/None.")
 
-    server_ip = {
-        "local":  get_local_ip(),
-        "public": get_public_ip()
-    }
+        wallet = fetch_wallet_balance()
+        if wallet.get("available_margin") is None:
+            logger.warning(
+                "api_signals: wallet available_margin is None — check the "
+                "fetch_wallet_balance logs above for the exact reason "
+                "(expired token / wrong scope / API error)."
+            )
 
-    # Latest candles for chart (last 60 1m candles)
-    chart_candles = []
-    for c in candles_1m[-60:]:
-        chart_candles.append({
-            "time":  c[0][:19].replace("T", " "),
-            "open":  c[1], "high": c[2],
-            "low":   c[3], "close": c[4],
-            "volume": c[5]
+        server_ip = {
+            "local":  get_local_ip(),
+            "public": get_public_ip()
+        }
+
+        # Latest candles for chart (last 60 1m candles)
+        chart_candles = []
+        for c in candles_1m[-60:]:
+            chart_candles.append({
+                "time":  c[0][:19].replace("T", " "),
+                "open":  c[1], "high": c[2],
+                "low":   c[3], "close": c[4],
+                "volume": c[5]
+            })
+
+        return jsonify({
+            "signals":    signals,
+            "candles":    chart_candles,
+            "wallet":     wallet,
+            "server_ip":  server_ip,
+            "timestamp":  datetime.now().strftime("%H:%M:%S"),
+            "market_open": market_open
         })
-
-    return jsonify({
-        "signals":    signals,
-        "candles":    chart_candles,
-        "wallet":     wallet,
-        "server_ip":  server_ip,
-        "timestamp":  datetime.now().strftime("%H:%M:%S"),
-        "market_open": market_open
-    })
+    except Exception as e:
+        logger.error(f"api_signals: unhandled exception: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/historical")
 def api_historical():
-    candles = fetch_historical("days", "1", 180)
-    candles = list(reversed(candles))
-    result = []
-    for c in candles:
-        result.append({
-            "date":   c[0][:10],
-            "open":   c[1], "high": c[2],
-            "low":    c[3], "close": c[4],
-            "volume": c[5]
-        })
-    return jsonify({"candles": result})
+    try:
+        candles = fetch_historical("days", "1", 180)
+        candles = list(reversed(candles))
+        result = []
+        for c in candles:
+            result.append({
+                "date":   c[0][:10],
+                "open":   c[1], "high": c[2],
+                "low":    c[3], "close": c[4],
+                "volume": c[5]
+            })
+        return jsonify({"candles": result})
+    except Exception as e:
+        logger.error(f"api_historical: unhandled exception: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 def is_market_open():
     now = datetime.now()
@@ -583,12 +730,82 @@ def is_market_open():
 @app.route("/api/ws_token")
 def ws_token():
     url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
+    logger.debug(f"ws_token: GET {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        return jsonify(r.json())
+        logger.debug(f"ws_token: status_code={r.status_code}")
+        body = r.json()
+        if r.status_code != 200 or body.get("status") != "success":
+            logger.error(f"ws_token: non-success response. HTTP={r.status_code}, body={json.dumps(body)[:1000]}")
+        return jsonify(body)
     except Exception as e:
+        logger.error(f"ws_token: error: {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug")
+def api_debug():
+    """
+    Quick diagnostic endpoint. Hit this in your browser (or curl) to see
+    exactly what each individual data source is returning RIGHT NOW, without
+    digging through app.log. Example: http://127.0.0.1:5000/api/debug
+    """
+    debug_info = {}
+
+    debug_info["access_token_present"] = bool(ACCESS_TOKEN)
+    debug_info["access_token_length"]  = len(ACCESS_TOKEN) if ACCESS_TOKEN else 0
+    debug_info["market_open"] = is_market_open()
+    debug_info["server_time"] = datetime.now().isoformat()
+
+    # LTP
+    try:
+        ltp = fetch_ltp()
+        debug_info["ltp"] = ltp
+        debug_info["ltp_ok"] = ltp is not None
+    except Exception as e:
+        debug_info["ltp"] = None
+        debug_info["ltp_ok"] = False
+        debug_info["ltp_error"] = str(e)
+
+    # Wallet
+    try:
+        wallet = fetch_wallet_balance()
+        debug_info["wallet"] = wallet
+        debug_info["wallet_ok"] = wallet.get("available_margin") is not None
+    except Exception as e:
+        debug_info["wallet"] = None
+        debug_info["wallet_ok"] = False
+        debug_info["wallet_error"] = str(e)
+
+    # Intraday 1m
+    try:
+        c1m = fetch_intraday("minutes", "1")
+        debug_info["candles_1m_count"] = len(c1m)
+        debug_info["candles_1m_sample"] = c1m[:2]
+    except Exception as e:
+        debug_info["candles_1m_count"] = 0
+        debug_info["candles_1m_error"] = str(e)
+
+    # Intraday 15m
+    try:
+        c15m = fetch_intraday("minutes", "15")
+        debug_info["candles_15m_count"] = len(c15m)
+        debug_info["candles_15m_sample"] = c15m[:2]
+    except Exception as e:
+        debug_info["candles_15m_count"] = 0
+        debug_info["candles_15m_error"] = str(e)
+
+    debug_info["hint"] = (
+        "If access_token_present is false -> fix your .env file. "
+        "If wallet_ok is false but token is present -> check app.log for the "
+        "exact HTTP status/body from get-funds-and-margin (likely 401 expired "
+        "token, or 403 missing scope). "
+        "If candles_1m_count is 0 during market hours -> check app.log for the "
+        "fetch_intraday error (instrument key / rate limit / token issue)."
+    )
+
+    return jsonify(debug_info)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    logger.info(f"Starting Flask app — logs are printed here AND saved to {LOG_FILE}")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
