@@ -17,7 +17,7 @@ profit factor > 1 across multiple symbols, this app's signals are
 informational only — do not size real trades off them yet.
 """
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
@@ -199,12 +199,18 @@ def api_signals():
 @app.route("/api/options")
 def api_options():
     """
-    Live Nifty 50 option chain — CE/PE, OI, PCR, centered on ATM strike.
+    Live Nifty 50 option chain — CE/PE, OI, IV, Greeks, PCR, centered on
+    ATM strike. Pass ?expiry=YYYY-MM-DD to pick a specific expiry; omit it
+    to get the nearest expiry automatically. The response always includes
+    `available_expiries` so the frontend can build a dropdown of every
+    expiry currently listed for Nifty 50.
+
     Read the comments in options_chain.py before treating PCR or OI moves
     as a standalone trading signal — they're context, not a verdict.
     """
     try:
-        chain = get_nifty_option_chain(ACCESS_TOKEN, strikes_around_atm=8)
+        expiry = request.args.get("expiry")
+        chain = get_nifty_option_chain(ACCESS_TOKEN, expiry_date=expiry, strikes_around_atm=10)
         return jsonify(chain)
     except Exception as e:
         logger.error(f"api_options: unhandled exception: {e}\n{traceback.format_exc()}")

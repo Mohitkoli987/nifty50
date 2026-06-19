@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Nifty50 Signal Bot</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
 <style>
   :root {
     --bg:        #0a0d14;
@@ -307,11 +309,28 @@ function renderIndicators(ind) {
   }).join('');
 }
 
+let candleRegistered = false;
+
 function initChart(candles) {
   const ctx = document.getElementById('priceChart').getContext('2d');
-  const labels = candles.map(c => c.time.slice(11, 16));
-  const closes = candles.map(c => c.close);
 
+  // chartjs-chart-financial needs its controller registered once
+  if (!candleRegistered && window.Chart && Chart.registry) {
+    try {
+      Chart.register(Chart.CandlestickController, Chart.CandlestickElement);
+      candleRegistered = true;
+    } catch (e) {
+      console.warn('Candlestick controller registration skipped (may already be registered):', e);
+      candleRegistered = true;
+    }
+  }
+
+  const ohlc = candles.map(c => ({
+    x: new Date(c.time.replace(' ', 'T')).getTime(),
+    o: c.open, h: c.high, l: c.low, c: c.close,
+  }));
+
+  const closes = candles.map(c => c.close);
   function ema(data, period) {
     if (data.length < period) return data.map(() => null);
     const k = 2 / (period + 1);
@@ -323,30 +342,63 @@ function initChart(candles) {
       return e;
     });
   }
-  const ema9 = ema(closes, 9);
-  const ema21 = ema(closes, 21);
+  const ema9 = ema(closes, 9).map((v, i) => ({ x: ohlc[i].x, y: v }));
+  const ema21 = ema(closes, 21).map((v, i) => ({ x: ohlc[i].x, y: v }));
 
   if (priceChart) priceChart.destroy();
+
   priceChart = new Chart(ctx, {
-    type: 'line',
+    type: 'candlestick',
     data: {
-      labels,
       datasets: [
-        { label: 'Close', data: closes, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.06)', borderWidth: 2, pointRadius: 0, tension: 0.3, fill: true },
-        { label: 'EMA9', data: ema9, borderColor: '#22c55e', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
-        { label: 'EMA21', data: ema21, borderColor: '#ef4444', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+        {
+          label: 'Nifty 50',
+          data: ohlc,
+          color: { up: '#22c55e', down: '#ef4444', unchanged: '#64748b' },
+          borderColor: { up: '#22c55e', down: '#ef4444', unchanged: '#64748b' },
+        },
+        {
+          type: 'line', label: 'EMA9', data: ema9,
+          borderColor: '#60a5fa', borderWidth: 1.5, pointRadius: 0, tension: 0.2,
+        },
+        {
+          type: 'line', label: 'EMA21', data: ema21,
+          borderColor: '#eab308', borderWidth: 1.5, pointRadius: 0, tension: 0.2,
+        },
       ]
     },
     options: {
-      responsive: true, maintainAspectRatio: false,
+      responsive: true,
+      maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { labels: { color: '#64748b', boxWidth: 12, font: { size: 11 } } },
-        tooltip: { backgroundColor: '#111827', borderColor: '#1f2d45', borderWidth: 1, titleColor: '#94a3b8', bodyColor: '#e2e8f0' }
+        tooltip: {
+          backgroundColor: '#111827', borderColor: '#1f2d45', borderWidth: 1,
+          titleColor: '#94a3b8', bodyColor: '#e2e8f0',
+          callbacks: {
+            label: (ctx) => {
+              const d = ctx.raw;
+              if (d && d.o !== undefined) {
+                return `O:${d.o.toFixed(2)} H:${d.h.toFixed(2)} L:${d.l.toFixed(2)} C:${d.c.toFixed(2)}`;
+              }
+              return `${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(2) ?? '--'}`;
+            }
+          }
+        }
       },
       scales: {
-        x: { ticks: { color: '#475569', maxTicksLimit: 12, font: { size: 10 } }, grid: { color: 'rgba(31,45,69,0.5)' } },
-        y: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: 'rgba(31,45,69,0.5)' }, position: 'right' }
+        x: {
+          type: 'time',
+          time: { unit: 'minute', displayFormats: { minute: 'HH:mm' } },
+          ticks: { color: '#475569', maxTicksLimit: 12, font: { size: 10 } },
+          grid: { color: 'rgba(31,45,69,0.5)' }
+        },
+        y: {
+          ticks: { color: '#475569', font: { size: 10 } },
+          grid: { color: 'rgba(31,45,69,0.5)' },
+          position: 'right'
+        }
       }
     }
   });
